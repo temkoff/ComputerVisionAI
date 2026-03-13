@@ -1,20 +1,25 @@
+# --- Установка библиотек (если ещё не установлены) ---
+!pip install ultralytics opencv-python-headless numpy scipy pandas
+
+# --- Импорт ---
 import cv2
 import numpy as np
 import pandas as pd
 from scipy.spatial import Delaunay
+from ultralytics import YOLO
+from google.colab.patches import cv2_imshow
+import time
 
+# --- Параметры ---
 video_path = "pigs.mp4"
+model = YOLO("yolov8n-seg.pt")  # предобученная сегментационная модель YOLOv8
 
-# эталонная йоркширская свинья
-REF_LENGTH_REAL = 1.2
-REF_WIDTH_REAL = 0.45
-
-cap = cv2.VideoCapture(video_path)
-
+REF_LENGTH_REAL = 1.2  # м
+REF_WIDTH_REAL = 0.45  # м
 results = []
 frame_id = 0
 
-
+# функция площади треугольника для FEM
 def triangle_area(a, b, c):
     return abs(
         a[0]*(b[1]-c[1]) +
@@ -22,122 +27,118 @@ def triangle_area(a, b, c):
         c[0]*(a[1]-b[1])
     ) / 2
 
+# функция объединения масок (удаление сильно пересекающихся)
+def merge_masks(masks_list, iou_threshold=0.3):
+    merged = []
+    for mask in masks_list:
+        keep = True
+        for m in merged:
+            # проверка пересечения
+            intersection = np.logical_and(mask, m).sum()
+            union = np.logical_or(mask, m).sum()
+            if union == 0:
+                continue
+            iou = intersection / union
+            if iou > iou_threshold:
+                keep = False
+                break
+        if keep:
+            merged.append(mask)
+    return merged
+
+# --- Открываем видео ---
+cap = cv2.VideoCapture(video_path)
 
 while True:
-
     ret, frame = cap.read()
     if not ret:
         break
-
     frame_id += 1
+    overlay = frame.copy()
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # --- Два прогона YOLO с разными порогами ---
+    results1 = model.predict(frame, conf=0.4, verbose=False)
+    results2 = model.predict(frame, conf=0.2, verbose=False)
 
-    blur = cv2.GaussianBlur(gray,(5,5),0)
+    masks_list = []
 
-    _, thresh = cv2.threshold(
-        blur,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    # морфология (убирает шум)
-    kernel = np.ones((7,7),np.uint8)
-
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-
-    contours,_ = cv2.findContours(
-        thresh,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    pig_id = 0
-
-    for contour in contours:
-
-        area = cv2.contourArea(contour)
-
-        if area < 5000:   # фильтр мусора
+    # --- собираем все маски с прогонов ---
+    for res in [results1, results2]:
+        if res is None or len(res) == 0:
             continue
-
-        pig_id += 1
-
-        rect = cv2.minAreaRect(contour)
-        (cx,cy),(w,h),angle = rect
-
-        length_pixels = max(w,h)
-        width_pixels = min(w,h)
-
-        scale_L = REF_LENGTH_REAL / length_pixels
-        scale_W = REF_WIDTH_REAL / width_pixels
-
-        scale = (scale_L + scale_W)/2
-
-        length_real = length_pixels * scale
-        width_real = width_pixels * scale
-
-        # создаём маску свиньи
-        mask = np.zeros(gray.shape, dtype=np.uint8)
-
-        cv2.drawContours(mask,[contour],-1,255,-1)
-
-        ys, xs = np.where(mask==255)
-
-        points = np.column_stack((xs,ys))
-
-        # уменьшаем число точек
-        if len(points) > 2000:
-            idx = np.random.choice(len(points),2000,replace=False)
-            points = points[idx]
-
-        if len(points) < 3:
+        res0 = res[0]
+        if not hasattr(res0, "masks") or res0.masks is None:
             continue
+        for poly in res0.masks.xy:
+            mask_img = np.zeros(frame.shape[:2], dtype=np.uint8)
+            pts = np.array(poly, dtype=np.int32)
+            cv2.fillPoly(mask_img, [pts], 255)
+            masks_list.append(mask_img)
 
-        tri = Delaunay(points)
+    # --- объединяем маски с удалением дубликатов ---
+    masks_merged = merge_masks(masks_list)
 
-        fem_area_pixels = 0
+    # --- обработка каждой отдельной маски ---
+    for pig_id, mask_img in enumerate(masks_merged):
+        # разделяем контуры на случай нескольких объектов в одной маске
+        contours, _ = cv2.findContours(mask_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt_id, contour in enumerate(contours):
+            mask_obj = np.zeros(frame.shape[:2], dtype=np.uint8)
+            cv2.drawContours(mask_obj, [contour], -1, 255, -1)
 
-        for simplex in tri.simplices:
+            # bounding box
+            x, y, w, h = cv2.boundingRect(contour)
+            scale_L = REF_LENGTH_REAL / w
+            scale_W = REF_WIDTH_REAL / h
+            scale = (scale_L + scale_W) / 2
+            length_real = w * scale
+            width_real = h * scale
 
-            a = points[simplex[0]]
-            b = points[simplex[1]]
-            c = points[simplex[2]]
+            # FEM
+            ys, xs = np.where(mask_obj == 255)
+            points = np.column_stack((xs, ys))
+            if len(points) < 3:
+                continue
+            if len(points) > 2000:
+                idx = np.random.choice(len(points), 2000, replace=False)
+                points = points[idx]
+            tri = Delaunay(points)
+            fem_area_pixels = sum(
+                triangle_area(points[a], points[b], points[c])
+                for a,b,c in tri.simplices
+            )\\\\\\
+            fem_area_real = fem_area_pixels * scale * scale
 
-            fem_area_pixels += triangle_area(a,b,c)
+            # Hu-моменты
+            contour2, _ = cv2.findContours(mask_obj, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            m = cv2.moments(contour2[0])
+            hu = cv2.HuMoments(m).flatten()
 
-        fem_area_real = fem_area_pixels * scale * scale
+            results.append({
+                "frame": frame_id,
+                "pig_id": f"{pig_id+1}_{cnt_id+1}",
+                "length_m": length_real,
+                "width_m": width_real,
+                "area_m2": fem_area_real,
+                "hu1": hu[0], "hu2": hu[1], "hu3": hu[2],
+                "hu4": hu[3], "hu5": hu[4], "hu6": hu[5], "hu7": hu[6]
+            })
 
-        moments = cv2.moments(contour)
+            # --- визуализация ---
+            cv2.polylines(overlay, [contour], isClosed=True, color=(0,255,0), thickness=2)
+            cx = int(np.mean(xs))
+            cy = int(np.mean(ys))
+            cv2.putText(overlay, f"Pig {pig_id+1}_{cnt_id+1}", (cx, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
 
-        hu = cv2.HuMoments(moments).flatten()
-
-        results.append({
-
-            "frame": frame_id,
-            "pig": pig_id,
-
-            "length_m": length_real,
-            "width_m": width_real,
-
-            "area_m2": fem_area_real,
-
-            "hu1": hu[0],
-            "hu2": hu[1],
-            "hu3": hu[2],
-            "hu4": hu[3],
-            "hu5": hu[4],
-            "hu6": hu[5],
-            "hu7": hu[6]
-
-        })
+    # --- вывод кадра с найденными свиньями ---
+    if len(masks_merged) > 0:
+        cv2_imshow(overlay)
+        time.sleep(0.1)
 
 cap.release()
 
+# --- сохраняем CSV ---
 df = pd.DataFrame(results)
-
-df.to_csv("pig_measurements.csv",index=False)
-
-print("Done")
+df.to_csv("pig_measurements_seg_double.csv", index=False)
+print("Готово! Результаты сохранены в pig_measurements_seg_double.csv")
