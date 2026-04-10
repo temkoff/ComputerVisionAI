@@ -1,24 +1,15 @@
-import os
-import subprocess
-from pathlib import Path
-import time
+#!pip install ultralytics
 
-# ---------- Настройки ----------
-CLIP_LENGTH_SEC = 300
-MIN_LENGTH_SEC = 360
-CHECK_INTERVAL = 60
-
-# ---------- ML БЛОК ----------
 import cv2
-from ultralytics import YOLO
+import time
 import pandas as pd
 import numpy as np
-
-from google.colab.patches import cv2_imshow
-from IPython.display import clear_output
 import matplotlib.pyplot as plt
 
-# --- Параметры ---
+from ultralytics import YOLO
+from google.colab.patches import cv2_imshow
+
+# ===================== ПАРАМЕТРЫ =====================
 video_path = "pigs.mp4"
 model = YOLO("yolov8n-seg.pt")
 
@@ -28,9 +19,11 @@ REF_WIDTH_REAL = 0.45
 results = []
 frame_id = 0
 
-# История кадров
-history_frames = []
-MAX_HISTORY = 6  # сколько кадров хранить
+# история всех кадров (не ограниченная)
+all_frames = []
+
+# ограничение, чтобы не перегрузить Colab
+MAX_TOTAL_FRAMES = 30
 
 cap = cv2.VideoCapture(video_path)
 
@@ -49,39 +42,21 @@ while True:
     if res.masks is None:
         continue
 
-    # Отрисовка
     annotated = res.plot()
 
-    # Сохраняем в историю
-    history_frames.append(annotated)
-    if len(history_frames) > MAX_HISTORY:
-        history_frames.pop(0)
+    # сохраняем кадр
+    all_frames.append(annotated)
 
-    # Очистка экрана
-    clear_output(wait=True)
+    # ограничение
+    if len(all_frames) > MAX_TOTAL_FRAMES:
+        break
 
-    # ТЕКУЩИЙ КАДР
-    print(f"Текущий кадр: {frame_id}")
+    print(f"Обработан кадр: {frame_id}")
+
+    # показываем текущий кадр
     cv2_imshow(annotated)
 
-    # ИСТОРИЯ
-    print("История кадров:")
-
-    fig, axes = plt.subplots(1, len(history_frames), figsize=(15, 5))
-
-    if len(history_frames) == 1:
-        axes = [axes]
-
-    for i, img in enumerate(history_frames):
-        axes[i].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        axes[i].set_title(f"{i+1}")
-        axes[i].axis('off')
-
-    plt.show()
-
-    time.sleep(0.1)
-
-    # Расчёт признаков
+    # ===================== ПРИЗНАКИ =====================
     for mask in res.masks.data:
 
         mask = mask.cpu().numpy()
@@ -112,7 +87,7 @@ while True:
 
 cap.release()
 
-# ---------- СОХРАНЕНИЕ ----------
+# ===================== СОХРАНЕНИЕ =====================
 df = pd.DataFrame(results)
 df.to_csv("generated_dataset.csv", index=False)
 
